@@ -1,6 +1,6 @@
 use rayon::iter::{
     IndexedParallelIterator, ParallelIterator,
-    plumbing::{Consumer, ProducerCallback, UnindexedConsumer},
+    plumbing::{Consumer, ProducerCallback, Reducer, UnindexedConsumer},
 };
 use std::marker::PhantomData;
 use tracing::Span;
@@ -103,7 +103,7 @@ where
     C: Consumer<T>,
 {
     type Folder = InSpanFolder<C::Folder>;
-    type Reducer = C::Reducer;
+    type Reducer = InSpanReducer<C::Reducer>;
     type Result = C::Result;
 
     fn split_at(self, index: usize) -> (Self, Self, Self::Reducer) {
@@ -111,8 +111,11 @@ where
         let span = self.span.clone();
         (
             InSpanConsumer::new(left, span.clone()),
-            InSpanConsumer::new(right, span),
-            reducer,
+            InSpanConsumer::new(right, span.clone()),
+            InSpanReducer {
+                inner: reducer,
+                span,
+            },
         )
     }
 
@@ -137,7 +140,10 @@ where
     }
 
     fn to_reducer(&self) -> Self::Reducer {
-        self.inner.to_reducer()
+        InSpanReducer {
+            inner: self.inner.to_reducer(),
+            span: self.span.clone(),
+        }
     }
 }
 
@@ -153,19 +159,32 @@ where
     type Result = F::Result;
 
     fn consume(self, item: T) -> Self {
-        let inner = self.span.in_scope(|| self.inner.consume(item));
         InSpanFolder {
-            inner,
+            inner: self.span.in_scope(|| self.inner.consume(item)),
             span: self.span,
         }
     }
 
     fn complete(self) -> Self::Result {
-        self.inner.complete()
+        self.span.in_scope(|| self.inner.complete())
     }
 
     fn full(&self) -> bool {
         self.inner.full()
+    }
+}
+
+struct InSpanReducer<R> {
+    inner: R,
+    span: Span,
+}
+
+impl<R, T> Reducer<T> for InSpanReducer<R>
+where
+    R: Reducer<T>,
+{
+    fn reduce(self, left: T, right: T) -> T {
+        self.span.in_scope(|| self.inner.reduce(left, right))
     }
 }
 
@@ -174,10 +193,10 @@ mod tests {
     use super::*;
     use rayon::iter::IntoParallelIterator;
     use std::sync::{Arc, Mutex};
-    use tracing::{span, Level};
+    use tracing::{Level, span};
     use tracing_core::Event;
-    use tracing_subscriber::layer::Context;
     use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::Context;
     use tracing_subscriber::prelude::*; // This imports SubscriberExt which provides .with()
 
     // Test utility: collect events in a thread-safe way
@@ -245,7 +264,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let span = span!(Level::INFO, "test_span");
-        
+
         let data = vec![1, 2];
         let result: Vec<i32> = data
             .into_par_iter()
@@ -261,9 +280,9 @@ mod tests {
 
         // Give some time for async logging to complete
         std::thread::sleep(std::time::Duration::from_millis(50));
-        
+
         let events = collector.get_events_string();
-        println!("Events: '{}'", events);       
+        println!("Events: '{}'", events);
     }
 
     #[test]
@@ -273,7 +292,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let span = span!(Level::INFO, "empty_test");
-        
+
         let data: Vec<i32> = vec![]; // Fixed the syntax error
         let result: Vec<i32> = data
             .into_par_iter()
@@ -285,10 +304,10 @@ mod tests {
             .collect();
 
         assert_eq!(result, vec![]);
-        
+
         // Give some time for async logging to complete
         std::thread::sleep(std::time::Duration::from_millis(10));
-        
+
         let events = collector.get_events_string();
         assert!(!events.contains("should not see this"));
     }
@@ -302,7 +321,8 @@ mod tests {
         // Test traced_in_span (regular parallel iterator)
         let span1 = span!(Level::INFO, "regular_span");
         let data = vec![1];
-        let result1: Vec<i32> = data.clone()
+        let result1: Vec<i32> = data
+            .clone()
             .into_par_iter()
             .in_span(span1)
             .map(|x| {
@@ -345,7 +365,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let span = span!(Level::INFO, "smoke_test");
-        
+
         let data = vec![42];
         let result: Vec<i32> = data
             .into_par_iter()
@@ -360,12 +380,38 @@ mod tests {
 
         // Give some time for async logging to complete
         std::thread::sleep(std::time::Duration::from_millis(50));
-        
+
         let events = collector.get_events();
         println!("Smoke test events count: {}", events.len());
 
         for event in &events {
             println!("Event: {}", event);
         }
+    }
+
+    #[test]
+    fn test_reduction_with_tracing() {
+        let collector = TestCollector::new();
+        let subscriber = tracing_subscriber::registry().with(collector.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let span = span!(Level::INFO, "reduction_span");
+
+        let data = vec![1, 2, 3, 4];
+        let sum = data.into_par_iter().in_span(span).reduce(
+            || 0,
+            |a, b| {
+                tracing::info!("Combining {} and {}", a, b);
+                a + b
+            },
+        );
+
+        assert_eq!(sum, 10);
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let events = collector.get_events_string();
+        assert!(events.contains("Combining"));
+        println!("Reduction events: {}", events);
     }
 }
